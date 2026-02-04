@@ -1,0 +1,364 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Practice Tracker</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
+  <style>
+    :root { --pico-font-size: 16px; }
+    body { min-height: 100vh; }
+    .container { max-width: 700px; padding: 2rem 1rem; }
+    .hidden { display: none !important; }
+    .stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1rem; margin-bottom: 2rem; }
+    .stat { text-align: center; padding: 1rem; background: var(--pico-card-background-color); border-radius: var(--pico-border-radius); }
+    .stat-value { font-size: 2rem; font-weight: 600; line-height: 1.2; }
+    .stat-label { font-size: 0.875rem; color: var(--pico-muted-color); }
+    .code-display { font-family: var(--pico-font-family-monospace); font-size: 1.5rem; text-align: center; padding: 1.5rem; background: var(--pico-card-background-color); border-radius: var(--pico-border-radius); margin-bottom: 0.5rem; letter-spacing: 0.1em; }
+    .code-help { font-size: 0.875rem; color: var(--pico-muted-color); text-align: center; margin-bottom: 2rem; }
+    .status-approved { color: var(--pico-ins-color); }
+    .status-pending { color: #f59e0b; }
+    .status-rejected, .status-missed { color: var(--pico-del-color); }
+    .result { margin-top: 1rem; padding: 1rem; border-radius: var(--pico-border-radius); }
+    .result.success { background: color-mix(in srgb, var(--pico-ins-color) 15%, transparent); }
+    .result.error { background: color-mix(in srgb, var(--pico-del-color) 15%, transparent); }
+    .result.warning { background: color-mix(in srgb, #f59e0b 15%, transparent); }
+    .submission-card { padding: 1rem; margin-bottom: 1rem; background: var(--pico-card-background-color); border-radius: var(--pico-border-radius); }
+    .submission-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.5rem; }
+    .ai-warning { color: var(--pico-del-color); font-weight: 600; }
+    .btn-group { display: flex; gap: 0.5rem; margin-top: 1rem; }
+    .btn-group button { flex: 1; }
+    video { width: 100%; max-height: 400px; background: #000; border-radius: var(--pico-border-radius); margin: 1rem 0; }
+    .consequence-box { padding: 1.5rem; background: color-mix(in srgb, var(--pico-del-color) 10%, transparent); border: 2px solid var(--pico-del-color); border-radius: var(--pico-border-radius); margin: 2rem 0; text-align: center; }
+    .nav-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 2rem; }
+    .nav-header h1 { margin: 0; }
+    .saturday-warning { padding: 1rem; background: color-mix(in srgb, #f59e0b 15%, transparent); border-radius: var(--pico-border-radius); margin-bottom: 1rem; }
+  </style>
+</head>
+<body>
+  <main class="container">
+    <!-- Login View -->
+    <section id="login-view">
+      <h1>Practice Tracker</h1>
+      <form id="login-form">
+        <label>
+          Username
+          <input type="text" name="username" required autocomplete="username">
+        </label>
+        <label>
+          Password
+          <input type="password" name="password" required autocomplete="current-password">
+        </label>
+        <button type="submit">Log in</button>
+      </form>
+      <div id="login-error" class="result error hidden"></div>
+    </section>
+
+    <!-- Friend View -->
+    <section id="friend-view" class="hidden">
+      <div class="nav-header">
+        <h1>Practice Tracker</h1>
+        <button class="outline" id="logout-btn">Log out</button>
+      </div>
+
+      <div class="stats">
+        <div class="stat">
+          <div class="stat-value" id="days-left">--</div>
+          <div class="stat-label">days left</div>
+        </div>
+        <div class="stat">
+          <div class="stat-value" id="weeks-left">--</div>
+          <div class="stat-label">weeks left</div>
+        </div>
+        <div class="stat">
+          <div class="stat-value" id="streak">--</div>
+          <div class="stat-label">week streak</div>
+        </div>
+      </div>
+
+      <div id="saturday-warning" class="saturday-warning hidden">
+        Today is Saturday. Deadline is Monday at midnight. Submit your video.
+      </div>
+
+      <section id="submit-section">
+        <h2>This Week</h2>
+        <p id="week-status"></p>
+        <div id="code-section">
+          <div class="code-display" id="weekly-code">------</div>
+          <p class="code-help">Write this code on paper and show it in your video</p>
+        </div>
+        <form id="upload-form">
+          <label>
+            Upload practice video
+            <input type="file" id="video" name="video" accept="video/*" required>
+          </label>
+          <button type="submit" id="submit-btn">Submit for review</button>
+        </form>
+        <div id="submit-result" class="result hidden"></div>
+      </section>
+
+      <section id="already-submitted" class="hidden">
+        <h2>This Week</h2>
+        <p id="submission-status"></p>
+      </section>
+    </section>
+
+    <!-- Admin View -->
+    <section id="admin-view" class="hidden">
+      <div class="nav-header">
+        <h1>Admin Dashboard</h1>
+        <button class="outline" id="admin-logout-btn">Log out</button>
+      </div>
+
+      <div class="stats">
+        <div class="stat">
+          <div class="stat-value" id="admin-streak">--</div>
+          <div class="stat-label">current streak</div>
+        </div>
+        <div class="stat">
+          <div class="stat-value" id="admin-days-left">--</div>
+          <div class="stat-label">days left</div>
+        </div>
+        <div class="stat">
+          <div class="stat-value" id="consequences-count">--</div>
+          <div class="stat-label">consequences</div>
+        </div>
+      </div>
+
+      <div id="consequence-section" class="consequence-box hidden">
+        <h3>Deadline Missed</h3>
+        <p>No approved submission this week. You can trigger the consequence.</p>
+        <button id="trigger-consequence-btn" class="contrast">Trigger Consequence ($5)</button>
+        <p id="consequence-result" style="margin-top: 1rem;"></p>
+      </div>
+
+      <div id="this-week-status" style="padding: 1rem; background: var(--pico-card-background-color); border-radius: var(--pico-border-radius); margin-bottom: 1rem;">
+        <h3 style="margin-top:0;">This Week</h3>
+        <p id="admin-week-status">Loading...</p>
+      </div>
+
+      <p style="color: var(--pico-muted-color); text-align: center;">Video reviews are sent via email with approve/reject links.</p>
+    </section>
+  </main>
+
+  <script>
+    let currentUser = null;
+
+    async function checkAuth() {
+      try {
+        const res = await fetch('/api/me');
+        if (res.ok) {
+          currentUser = await res.json();
+          showView(currentUser.role);
+        } else {
+          showView('login');
+        }
+      } catch {
+        showView('login');
+      }
+    }
+
+    function showView(view) {
+      document.getElementById('login-view').classList.toggle('hidden', view !== 'login');
+      document.getElementById('friend-view').classList.toggle('hidden', view !== 'friend');
+      document.getElementById('admin-view').classList.toggle('hidden', view !== 'admin');
+
+      if (view === 'friend') loadFriendDashboard();
+      if (view === 'admin') loadAdminDashboard();
+    }
+
+    // Login
+    document.getElementById('login-form').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const form = e.target;
+      const errorEl = document.getElementById('login-error');
+
+      try {
+        const res = await fetch('/api/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            username: form.username.value,
+            password: form.password.value,
+          }),
+        });
+
+        const data = await res.json();
+        if (res.ok) {
+          currentUser = { role: data.role };
+          showView(data.role);
+        } else {
+          errorEl.textContent = data.error;
+          errorEl.classList.remove('hidden');
+        }
+      } catch (err) {
+        errorEl.textContent = 'Login failed';
+        errorEl.classList.remove('hidden');
+      }
+    });
+
+    // Logout
+    document.getElementById('logout-btn').addEventListener('click', logout);
+    document.getElementById('admin-logout-btn').addEventListener('click', logout);
+
+    async function logout() {
+      await fetch('/api/logout', { method: 'POST' });
+      currentUser = null;
+      showView('login');
+    }
+
+    // Friend dashboard
+    async function loadFriendDashboard() {
+      try {
+        const res = await fetch('/api/dashboard');
+        const data = await res.json();
+
+        document.getElementById('days-left').textContent = data.daysUntilWedding;
+        document.getElementById('weeks-left').textContent = data.weeksUntilWedding;
+        document.getElementById('streak').textContent = data.streak;
+        document.getElementById('weekly-code').textContent = data.weeklyCode;
+
+        const saturdayWarning = document.getElementById('saturday-warning');
+        saturdayWarning.classList.toggle('hidden', !data.isSaturday || data.thisWeekStatus !== 'not_submitted');
+
+        const submitSection = document.getElementById('submit-section');
+        const alreadySection = document.getElementById('already-submitted');
+        const statusEl = document.getElementById('submission-status');
+
+        if (data.thisWeekStatus === 'not_submitted') {
+          submitSection.classList.remove('hidden');
+          alreadySection.classList.add('hidden');
+          const deadline = new Date(data.deadline);
+          document.getElementById('week-status').innerHTML =
+            `Due by ${deadline.toLocaleDateString('en-US', { weekday: 'long', month: 'short', day: 'numeric' })} at midnight`;
+        } else {
+          submitSection.classList.add('hidden');
+          alreadySection.classList.remove('hidden');
+          const statusClass = `status-${data.thisWeekStatus}`;
+          const statusText = {
+            pending: 'Submitted - waiting for review',
+            approved: 'Approved for this week',
+            rejected: 'Rejected - you can submit again',
+          }[data.thisWeekStatus];
+          statusEl.innerHTML = `<span class="${statusClass}">${statusText}</span>`;
+
+          if (data.thisWeekStatus === 'rejected') {
+            submitSection.classList.remove('hidden');
+          }
+        }
+      } catch (err) {
+        console.error('Dashboard error:', err);
+      }
+    }
+
+    // Upload
+    document.getElementById('upload-form').addEventListener('submit', async (e) => {
+      e.preventDefault();
+
+      const fileInput = document.getElementById('video');
+      const submitBtn = document.getElementById('submit-btn');
+      const resultEl = document.getElementById('submit-result');
+
+      if (!fileInput.files[0]) return;
+
+      submitBtn.disabled = true;
+      submitBtn.setAttribute('aria-busy', 'true');
+      submitBtn.textContent = 'Uploading & analyzing...';
+      resultEl.classList.add('hidden');
+
+      const formData = new FormData();
+      formData.append('video', fileInput.files[0]);
+
+      try {
+        const res = await fetch('/api/submit', {
+          method: 'POST',
+          body: formData,
+        });
+
+        const data = await res.json();
+        resultEl.classList.remove('hidden', 'success', 'error', 'warning');
+
+        if (data.success) {
+          resultEl.classList.add('success');
+          resultEl.textContent = 'Submitted for review.';
+          setTimeout(loadFriendDashboard, 1500);
+        } else {
+          resultEl.classList.add('error');
+          resultEl.textContent = data.error || 'Submission failed';
+        }
+      } catch {
+        resultEl.classList.remove('hidden');
+        resultEl.classList.add('error');
+        resultEl.textContent = 'Upload failed';
+      } finally {
+        submitBtn.disabled = false;
+        submitBtn.removeAttribute('aria-busy');
+        submitBtn.textContent = 'Submit for review';
+      }
+    });
+
+    // Admin dashboard
+    async function loadAdminDashboard() {
+      try {
+        const res = await fetch('/api/dashboard');
+        const data = await res.json();
+
+        document.getElementById('admin-streak').textContent = data.streak;
+        document.getElementById('admin-days-left').textContent = data.daysUntilWedding;
+
+        // Get deadline status
+        const deadlineRes = await fetch('/api/admin/deadline-status');
+        const deadlineData = await deadlineRes.json();
+
+        document.getElementById('consequences-count').textContent = deadlineData.alreadyTriggered ? '1+' : '0';
+
+        // This week status
+        const statusEl = document.getElementById('admin-week-status');
+        const statusClass = `status-${data.thisWeekStatus}`;
+        const statusText = {
+          not_submitted: 'No submission yet',
+          pending: 'Submitted - check your email to review',
+          approved: 'Approved',
+          rejected: 'Rejected - waiting for resubmission',
+        }[data.thisWeekStatus] || data.thisWeekStatus;
+        statusEl.innerHTML = `<span class="${statusClass}">${statusText}</span>`;
+
+        // Consequence section
+        const consequenceSection = document.getElementById('consequence-section');
+        if (deadlineData.canTriggerConsequence) {
+          consequenceSection.classList.remove('hidden');
+        } else {
+          consequenceSection.classList.add('hidden');
+        }
+
+      } catch (err) {
+        console.error('Admin dashboard error:', err);
+      }
+    }
+
+    document.getElementById('trigger-consequence-btn').addEventListener('click', async () => {
+      if (!confirm('Trigger consequence? This will reset the streak and notify Victor to pay $5.')) {
+        return;
+      }
+
+      try {
+        const res = await fetch('/api/admin/trigger-consequence', { method: 'POST' });
+        const data = await res.json();
+
+        const resultEl = document.getElementById('consequence-result');
+        if (res.ok) {
+          resultEl.innerHTML = `Consequence triggered. Victor has been notified. <a href="${data.paypalLink}" target="_blank">PayPal link ($5)</a>`;
+          loadAdminDashboard();
+        } else {
+          resultEl.textContent = data.error;
+        }
+      } catch {
+        document.getElementById('consequence-result').textContent = 'Failed to trigger';
+      }
+    });
+
+    // Init
+    checkAuth();
+  </script>
+</body>
+</html>

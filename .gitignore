@@ -1,0 +1,17 @@
+# Dependencies
+node_modules/
+
+# Environment variables (secrets)
+.env
+
+# Data
+data/data.json
+
+# Uploads
+uploads/
+
+# Test files
+test-video.mp4
+
+# OS files
+.DS_Store
