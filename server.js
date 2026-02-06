@@ -66,15 +66,18 @@ async function saveData(data) {
 // Email transporter
 let emailTransporter = null;
 if (CONFIG.SMTP_USER && CONFIG.SMTP_PASS) {
+  // Use port 465 with SSL (more reliable on hosted platforms like Render)
   emailTransporter = nodemailer.createTransport({
     host: CONFIG.SMTP_HOST,
-    port: CONFIG.SMTP_PORT,
-    secure: false,
+    port: 465,
+    secure: true, // Use SSL
     auth: {
       user: CONFIG.SMTP_USER,
       pass: CONFIG.SMTP_PASS,
     },
+    connectionTimeout: 30000, // 30 second timeout
   });
+  console.log('[EMAIL] Transporter configured with SSL on port 465');
 }
 
 async function sendEmail(to, subject, html) {
@@ -335,21 +338,29 @@ function compressVideo(inputPath, outputPath) {
 }
 
 app.post('/api/submit', requireAuth, upload.single('video'), async (req, res) => {
+  console.log('[SUBMIT] Starting submission process');
+
   if (req.session.user.role !== 'friend') {
+    console.log('[SUBMIT] Rejected: not friend role');
     return res.status(403).json({ error: 'Only friend can submit' });
   }
 
   if (!req.file) {
+    console.log('[SUBMIT] Rejected: no video file');
     return res.status(400).json({ error: 'No video uploaded' });
   }
 
+  console.log(`[SUBMIT] Video received: ${req.file.filename}, size: ${(req.file.size / 1024 / 1024).toFixed(1)}MB`);
+
   const currentWeek = getCurrentWeek();
   const weeklyCode = getWeeklyCode();
+  console.log(`[SUBMIT] Week: ${currentWeek}, Code: ${weeklyCode}`);
 
   // Check if already has pending or approved submission
   const data = await getData();
   const existing = data.submissions.find(s => s.week === currentWeek);
   if (existing && (existing.status === 'approved' || existing.status === 'pending')) {
+    console.log(`[SUBMIT] Rejected: already ${existing.status} for this week`);
     fs.unlinkSync(req.file.path);
     return res.status(400).json({
       error: existing.status === 'approved'
@@ -363,10 +374,13 @@ app.post('/api/submit', requireAuth, upload.single('video'), async (req, res) =>
     const submissionId = crypto.randomBytes(8).toString('hex');
     const approveToken = generateApprovalToken(submissionId, 'approve');
     const rejectToken = generateApprovalToken(submissionId, 'reject');
+    console.log(`[SUBMIT] Generated submission ID: ${submissionId}`);
 
     // Compress video for email
     const compressedPath = req.file.path.replace(/\.[^.]+$/, '_compressed.mp4');
+    console.log('[SUBMIT] Starting video compression...');
     const compressionSuccess = compressVideo(req.file.path, compressedPath);
+    console.log(`[SUBMIT] Compression ${compressionSuccess ? 'succeeded' : 'failed/skipped'}`);
 
     // Save submission as pending (no video path stored since we email it)
     const submission = {
@@ -420,8 +434,15 @@ app.post('/api/submit', requireAuth, upload.single('video'), async (req, res) =>
       ? emailHtml.replace('Video is attached.', '<strong>Note: Video too large to attach (over 25MB). Please request it from Victor.</strong>')
       : emailHtml;
 
+    console.log('[SUBMIT] About to send email...');
+    console.log(`[SUBMIT] Email transporter exists: ${!!emailTransporter}`);
+    console.log(`[SUBMIT] Admin email: ${CONFIG.ADMIN_EMAIL}`);
+    console.log(`[SUBMIT] Video too large for attachment: ${videoTooLarge}`);
+    console.log(`[SUBMIT] Attachment size: ${(attachmentSize / 1024 / 1024).toFixed(1)}MB`);
+
     if (emailTransporter) {
       try {
+        console.log('[SUBMIT] Calling sendMail...');
         await emailTransporter.sendMail({
           from: CONFIG.SMTP_USER,
           to: CONFIG.ADMIN_EMAIL,
@@ -432,12 +453,14 @@ app.post('/api/submit', requireAuth, upload.single('video'), async (req, res) =>
             path: videoToAttach,
           }] : [],
         });
-        console.log(`Email sent to ${CONFIG.ADMIN_EMAIL} ${videoTooLarge ? 'without' : 'with'} video (${(attachmentSize / 1024 / 1024).toFixed(1)}MB)`);
+        console.log(`[SUBMIT] Email sent successfully to ${CONFIG.ADMIN_EMAIL}`);
       } catch (emailErr) {
-        console.error('Email error:', emailErr);
+        console.error('[SUBMIT] Email error:', emailErr.message);
+        console.error('[SUBMIT] Email error code:', emailErr.code);
+        console.error('[SUBMIT] Full error:', emailErr);
       }
     } else {
-      console.log(`[EMAIL NOT CONFIGURED] Would send to: ${CONFIG.ADMIN_EMAIL}`);
+      console.log(`[SUBMIT] EMAIL NOT CONFIGURED - Would send to: ${CONFIG.ADMIN_EMAIL}`);
     }
 
     // Clean up video files after sending
