@@ -8,6 +8,7 @@ const bcrypt = require('bcrypt');
 const session = require('express-session');
 const nodemailer = require('nodemailer');
 const { execSync } = require('child_process');
+const { MongoClient } = require('mongodb');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -26,6 +27,41 @@ const CONFIG = {
   SMTP_USER: process.env.SMTP_USER || '',
   SMTP_PASS: process.env.SMTP_PASS || '',
 };
+
+// MongoDB connection
+let db;
+async function connectDB() {
+  const uri = process.env.MONGODB_URI;
+  if (!uri) {
+    console.error('ERROR: MONGODB_URI not set');
+    process.exit(1);
+  }
+  const client = new MongoClient(uri);
+  await client.connect();
+  db = client.db('practice');
+  console.log('Connected to MongoDB');
+}
+
+// Data helpers using MongoDB
+async function getData() {
+  const appData = await db.collection('appData').findOne({ _id: 'main' });
+  if (!appData) {
+    const initial = {
+      _id: 'main',
+      users: {},
+      submissions: [],
+      streak: 0,
+      consequencesTriggered: [],
+    };
+    await db.collection('appData').insertOne(initial);
+    return initial;
+  }
+  return appData;
+}
+
+async function saveData(data) {
+  await db.collection('appData').replaceOne({ _id: 'main' }, data, { upsert: true });
+}
 
 // Email transporter
 let emailTransporter = null;
@@ -97,27 +133,6 @@ const upload = multer({
 app.use(express.static('public'));
 app.use(express.json());
 
-// Data helpers
-const DATA_PATH = path.join(__dirname, 'data', 'data.json');
-
-function getData() {
-  if (!fs.existsSync(DATA_PATH)) {
-    const initial = {
-      users: {},
-      submissions: [],
-      streak: 0,
-      consequencesTriggered: [],
-    };
-    fs.writeFileSync(DATA_PATH, JSON.stringify(initial, null, 2));
-    return initial;
-  }
-  return JSON.parse(fs.readFileSync(DATA_PATH, 'utf8'));
-}
-
-function saveData(data) {
-  fs.writeFileSync(DATA_PATH, JSON.stringify(data, null, 2));
-}
-
 // Secure weekly code generation using HMAC
 function getWeeklyCode() {
   const now = new Date();
@@ -151,14 +166,14 @@ function getDeadline() {
   return deadline;
 }
 
-function hasApprovedSubmissionThisWeek() {
-  const data = getData();
+async function hasApprovedSubmissionThisWeek() {
+  const data = await getData();
   const currentWeek = getCurrentWeek();
   return data.submissions.some(s => s.week === currentWeek && s.status === 'approved');
 }
 
-function hasPendingSubmissionThisWeek() {
-  const data = getData();
+async function hasPendingSubmissionThisWeek() {
+  const data = await getData();
   const currentWeek = getCurrentWeek();
   return data.submissions.some(s => s.week === currentWeek && s.status === 'pending');
 }
@@ -182,15 +197,18 @@ function requireAdmin(req, res, next) {
 
 // Initialize users from environment variables (run once on first setup)
 async function initializeUsers() {
-  const data = getData();
+  const data = await getData();
   const adminPassword = process.env.ADMIN_PASSWORD;
   const friendPassword = process.env.FRIEND_PASSWORD;
+
+  let changed = false;
 
   // Create admin user (elias) if doesn't exist and password is set
   if (!data.users['elias'] && adminPassword) {
     const hash = await bcrypt.hash(adminPassword, 12);
     data.users['elias'] = { hash, role: 'admin', createdAt: new Date().toISOString() };
     console.log('Created admin user: elias');
+    changed = true;
   }
 
   // Create friend user (victor) if doesn't exist and password is set
@@ -198,13 +216,16 @@ async function initializeUsers() {
     const hash = await bcrypt.hash(friendPassword, 12);
     data.users['victor'] = { hash, role: 'friend', createdAt: new Date().toISOString() };
     console.log('Created friend user: victor');
+    changed = true;
   }
 
   if (Object.keys(data.users).length === 0) {
     console.log('WARNING: No users configured. Set ADMIN_PASSWORD and FRIEND_PASSWORD env vars.');
   }
 
-  saveData(data);
+  if (changed) {
+    await saveData(data);
+  }
 }
 
 // Generate secure approval token
@@ -223,7 +244,7 @@ function verifyApprovalToken(submissionId, action, token) {
 app.post('/api/login', async (req, res) => {
   const { username, password } = req.body;
 
-  const data = getData();
+  const data = await getData();
   const user = data.users[username];
 
   if (!user) {
@@ -253,8 +274,8 @@ app.get('/api/me', (req, res) => {
 });
 
 // Friend routes
-app.get('/api/dashboard', requireAuth, (req, res) => {
-  const data = getData();
+app.get('/api/dashboard', requireAuth, async (req, res) => {
+  const data = await getData();
   const now = new Date();
   const daysUntilWedding = Math.ceil((CONFIG.WEDDING_DATE - now) / (1000 * 60 * 60 * 24));
   const weeksUntilWedding = Math.ceil(daysUntilWedding / 7);
@@ -309,7 +330,7 @@ app.post('/api/submit', requireAuth, upload.single('video'), async (req, res) =>
   const weeklyCode = getWeeklyCode();
 
   // Check if already has pending or approved submission
-  const data = getData();
+  const data = await getData();
   const existing = data.submissions.find(s => s.week === currentWeek);
   if (existing && (existing.status === 'approved' || existing.status === 'pending')) {
     fs.unlinkSync(req.file.path);
@@ -341,7 +362,7 @@ app.post('/api/submit', requireAuth, upload.single('video'), async (req, res) =>
     // Remove old rejected submission for this week if exists
     data.submissions = data.submissions.filter(s => !(s.week === currentWeek && s.status === 'rejected'));
     data.submissions.push(submission);
-    saveData(data);
+    await saveData(data);
 
     // Build approval links
     const baseUrl = process.env.APP_URL || `http://localhost:${PORT}`;
@@ -435,7 +456,7 @@ app.get('/api/review', async (req, res) => {
     return res.status(403).send(htmlResponse('Invalid Token', 'This approval link is invalid.', 'error'));
   }
 
-  const data = getData();
+  const data = await getData();
   const submission = data.submissions.find(s => s.id === id);
 
   if (!submission) {
@@ -453,7 +474,7 @@ app.get('/api/review', async (req, res) => {
     data.streak = (data.streak || 0) + 1;
   }
 
-  saveData(data);
+  await saveData(data);
 
   // Notify Victor of result
   const resultEmoji = action === 'approve' ? '✅' : '❌';
@@ -491,10 +512,9 @@ h1{color:${colors[type]};margin-bottom:1rem;}p{color:#666;}</style></head>
 <body><div class="card"><h1>${title}</h1><p>${message}</p></div></body></html>`;
 }
 
-// Admin routes (keeping for potential future use and cron jobs)
-
-app.get('/api/admin/deadline-status', requireAdmin, (req, res) => {
-  const data = getData();
+// Admin routes
+app.get('/api/admin/deadline-status', requireAdmin, async (req, res) => {
+  const data = await getData();
   const currentWeek = getCurrentWeek();
   const deadline = getDeadline();
   const now = new Date();
@@ -519,7 +539,7 @@ app.get('/api/admin/deadline-status', requireAdmin, (req, res) => {
 });
 
 app.post('/api/admin/trigger-consequence', requireAdmin, async (req, res) => {
-  const data = getData();
+  const data = await getData();
   const currentWeek = getCurrentWeek();
 
   if (!data.consequencesTriggered) data.consequencesTriggered = [];
@@ -531,7 +551,7 @@ app.post('/api/admin/trigger-consequence', requireAdmin, async (req, res) => {
   // Reset streak
   data.streak = 0;
   data.consequencesTriggered.push(currentWeek);
-  saveData(data);
+  await saveData(data);
 
   const paypalLink = `https://paypal.me/${CONFIG.PAYPAL_ME_USERNAME}/${CONFIG.CONSEQUENCE_AMOUNT}`;
 
@@ -564,7 +584,7 @@ app.post('/api/cron/saturday-reminder', async (req, res) => {
     return res.json({ skipped: true, reason: 'Not Saturday' });
   }
 
-  if (hasApprovedSubmissionThisWeek() || hasPendingSubmissionThisWeek()) {
+  if (await hasApprovedSubmissionThisWeek() || await hasPendingSubmissionThisWeek()) {
     return res.json({ skipped: true, reason: 'Already submitted' });
   }
 
@@ -600,12 +620,12 @@ app.post('/api/cron/deadline-check', async (req, res) => {
     return res.json({ skipped: true, reason: 'Not Monday' });
   }
 
-  if (hasApprovedSubmissionThisWeek()) {
+  if (await hasApprovedSubmissionThisWeek()) {
     return res.json({ skipped: true, reason: 'Already approved' });
   }
 
   const currentWeek = getCurrentWeek();
-  const data = getData();
+  const data = await getData();
   const alreadyTriggered = (data.consequencesTriggered || []).includes(currentWeek);
 
   if (alreadyTriggered) {
@@ -616,18 +636,22 @@ app.post('/api/cron/deadline-check', async (req, res) => {
     CONFIG.ADMIN_EMAIL,
     'DEADLINE MISSED - Consequence Available',
     `<p>The practice deadline has passed and no video was approved for ${currentWeek}.</p>
-    <p><a href="${process.env.APP_URL || 'http://localhost:' + PORT}/admin" style="background: #dc3545; color: white; padding: 12px 24px; text-decoration: none; border-radius: 4px;">Trigger Consequence</a></p>`
+    <p><a href="${process.env.APP_URL || 'http://localhost:' + PORT}" style="background: #dc3545; color: white; padding: 12px 24px; text-decoration: none; border-radius: 4px;">Trigger Consequence</a></p>`
   );
 
   res.json({ success: true, alertSent: true });
 });
 
 // Initialize and start server
-initializeUsers().then(() => {
+connectDB().then(async () => {
+  await initializeUsers();
   app.listen(PORT, () => {
     console.log(`Server running at http://localhost:${PORT}`);
     console.log(`Wedding: ${CONFIG.WEDDING_DATE.toDateString()}`);
     console.log(`This week's code: ${getWeeklyCode()}`);
     console.log(`Deadline: ${getDeadline().toISOString()}`);
   });
+}).catch(err => {
+  console.error('Failed to start:', err);
+  process.exit(1);
 });
