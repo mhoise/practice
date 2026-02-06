@@ -130,6 +130,9 @@ const upload = multer({
   },
 });
 
+// Trust proxy for Render (needed for secure cookies)
+app.set('trust proxy', 1);
+
 app.use(express.static('public'));
 app.use(express.json());
 

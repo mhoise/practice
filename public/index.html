@@ -301,26 +301,34 @@
     async function loadAdminDashboard() {
       try {
         const res = await fetch('/api/dashboard');
+        if (!res.ok) {
+          console.error('Dashboard API error:', res.status);
+          return;
+        }
         const data = await res.json();
 
-        document.getElementById('admin-streak').textContent = data.streak;
-        document.getElementById('admin-days-left').textContent = data.daysUntilWedding;
+        document.getElementById('admin-streak').textContent = data.streak ?? 0;
+        document.getElementById('admin-days-left').textContent = data.daysUntilWedding ?? 0;
 
         // Get deadline status
         const deadlineRes = await fetch('/api/admin/deadline-status');
+        if (!deadlineRes.ok) {
+          console.error('Deadline API error:', deadlineRes.status);
+          return;
+        }
         const deadlineData = await deadlineRes.json();
 
         document.getElementById('consequences-count').textContent = deadlineData.alreadyTriggered ? '1+' : '0';
 
         // This week status
         const statusEl = document.getElementById('admin-week-status');
-        const statusClass = `status-${data.thisWeekStatus}`;
+        const statusClass = `status-${data.thisWeekStatus || 'not_submitted'}`;
         const statusText = {
           not_submitted: 'No submission yet',
           pending: 'Submitted - check your email to review',
           approved: 'Approved',
           rejected: 'Rejected - waiting for resubmission',
-        }[data.thisWeekStatus] || data.thisWeekStatus;
+        }[data.thisWeekStatus] || 'No submission yet';
         statusEl.innerHTML = `<span class="${statusClass}">${statusText}</span>`;
 
         // Consequence section
