@@ -305,8 +305,22 @@ app.get('/api/dashboard', requireAuth, async (req, res) => {
   });
 });
 
+// Check if ffmpeg is available
+function ffmpegAvailable() {
+  try {
+    execSync('which ffmpeg', { stdio: 'pipe' });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 // Compress video using ffmpeg
 function compressVideo(inputPath, outputPath) {
+  if (!ffmpegAvailable()) {
+    console.log('ffmpeg not available, skipping compression');
+    return false;
+  }
   try {
     // Compress to 720p, lower bitrate for email attachment (~10-15MB target)
     execSync(`ffmpeg -i "${inputPath}" -vf "scale=-2:720" -c:v libx264 -preset fast -crf 28 -c:a aac -b:a 128k -y "${outputPath}"`, {
@@ -391,23 +405,34 @@ app.post('/api/submit', requireAuth, upload.single('video'), async (req, res) =>
       <p style="color:#666;font-size:0.875rem;">Click a button above to approve or reject this submission.</p>
     `;
 
-    // Send email with attachment
+    // Send response immediately so user doesn't wait
+    res.json({
+      success: true,
+      message: 'Submitted for review',
+    });
+
+    // Send email with attachment (async, after response)
     const videoToAttach = compressionSuccess && fs.existsSync(compressedPath) ? compressedPath : req.file.path;
     const attachmentSize = fs.statSync(videoToAttach).size;
+    const videoTooLarge = attachmentSize >= 25 * 1024 * 1024;
+
+    const finalEmailHtml = videoTooLarge
+      ? emailHtml.replace('Video is attached.', '<strong>Note: Video too large to attach (over 25MB). Please request it from Victor.</strong>')
+      : emailHtml;
 
     if (emailTransporter) {
       try {
         await emailTransporter.sendMail({
           from: CONFIG.SMTP_USER,
           to: CONFIG.ADMIN_EMAIL,
-          subject: `🎻 Practice Video - ${currentWeek}`,
-          html: emailHtml,
-          attachments: attachmentSize < 25 * 1024 * 1024 ? [{ // Only attach if under 25MB
+          subject: `🎻 Practice Video - ${currentWeek}${videoTooLarge ? ' (no attachment)' : ''}`,
+          html: finalEmailHtml,
+          attachments: !videoTooLarge ? [{
             filename: `practice-${currentWeek}.mp4`,
             path: videoToAttach,
           }] : [],
         });
-        console.log(`Email sent to ${CONFIG.ADMIN_EMAIL} with video (${(attachmentSize / 1024 / 1024).toFixed(1)}MB)`);
+        console.log(`Email sent to ${CONFIG.ADMIN_EMAIL} ${videoTooLarge ? 'without' : 'with'} video (${(attachmentSize / 1024 / 1024).toFixed(1)}MB)`);
       } catch (emailErr) {
         console.error('Email error:', emailErr);
       }
@@ -424,11 +449,6 @@ app.post('/api/submit', requireAuth, upload.single('video'), async (req, res) =>
     } catch (cleanupErr) {
       console.error('Cleanup error:', cleanupErr);
     }
-
-    res.json({
-      success: true,
-      message: 'Submitted for review',
-    });
 
   } catch (error) {
     console.error('Submit error:', error);
