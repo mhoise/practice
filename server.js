@@ -6,9 +6,10 @@ const fs = require('fs');
 const crypto = require('crypto');
 const bcrypt = require('bcrypt');
 const session = require('express-session');
-const nodemailer = require('nodemailer');
+const MongoStore = require('connect-mongo');
+const cron = require('node-cron');
 const { execSync } = require('child_process');
-const { MongoClient } = require('mongodb');
+const { MongoClient, GridFSBucket, ObjectId } = require('mongodb');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -21,15 +22,13 @@ const CONFIG = {
   SESSION_SECRET: process.env.SESSION_SECRET || crypto.randomBytes(32).toString('hex'),
   CODE_SECRET: process.env.CODE_SECRET || crypto.randomBytes(32).toString('hex'),
   ADMIN_EMAIL: process.env.ADMIN_EMAIL || '',
-  FRIEND_EMAIL: process.env.FRIEND_EMAIL || '',
-  SMTP_HOST: process.env.SMTP_HOST || 'smtp.gmail.com',
-  SMTP_PORT: process.env.SMTP_PORT || 587,
-  SMTP_USER: process.env.SMTP_USER || '',
-  SMTP_PASS: process.env.SMTP_PASS || '',
+  DISCORD_WEBHOOK_URL: process.env.DISCORD_WEBHOOK_URL || '',
+  VICTOR_DISCORD_ID: process.env.VICTOR_DISCORD_ID || '625081496541331516',
 };
 
 // MongoDB connection
 let db;
+let bucket;
 async function connectDB() {
   const uri = process.env.MONGODB_URI;
   if (!uri) {
@@ -39,7 +38,8 @@ async function connectDB() {
   const client = new MongoClient(uri);
   await client.connect();
   db = client.db('practice');
-  console.log('Connected to MongoDB');
+  bucket = new GridFSBucket(db, { bucketName: 'fs' });
+  console.log('Connected to MongoDB with GridFS');
 }
 
 // Data helpers using MongoDB
@@ -63,48 +63,128 @@ async function saveData(data) {
   await db.collection('appData').replaceOne({ _id: 'main' }, data, { upsert: true });
 }
 
-// Email transporter
-let emailTransporter = null;
-if (CONFIG.SMTP_USER && CONFIG.SMTP_PASS) {
-  // Use port 465 with SSL (more reliable on hosted platforms like Render)
-  emailTransporter = nodemailer.createTransport({
-    host: CONFIG.SMTP_HOST,
-    port: 465,
-    secure: true, // Use SSL
-    auth: {
-      user: CONFIG.SMTP_USER,
-      pass: CONFIG.SMTP_PASS,
-    },
-    connectionTimeout: 30000, // 30 second timeout
-  });
-  console.log('[EMAIL] Transporter configured with SSL on port 465');
+// Submissions collection data access (separate from appData)
+async function getSubmissions(filter = {}) {
+  return await db.collection('submissions').find(filter).sort({ submittedAt: -1 }).toArray();
 }
 
-async function sendEmail(to, subject, html) {
-  if (!emailTransporter) {
-    console.log(`[EMAIL NOT CONFIGURED] To: ${to}, Subject: ${subject}`);
+async function getSubmissionById(id) {
+  return await db.collection('submissions').findOne({ id });
+}
+
+async function saveSubmission(submission) {
+  await db.collection('submissions').insertOne(submission);
+}
+
+async function updateSubmission(id, updates) {
+  await db.collection('submissions').updateOne({ id }, { $set: updates });
+}
+
+async function deleteSubmission(id) {
+  const submission = await getSubmissionById(id);
+  if (submission && submission.videoFileId) {
+    try {
+      await bucket.delete(new ObjectId(submission.videoFileId));
+    } catch (err) {
+      console.error('Error deleting video from GridFS:', err);
+    }
+  }
+  await db.collection('submissions').deleteOne({ id });
+}
+
+async function deleteAllSubmissions() {
+  // Delete all videos from GridFS
+  const submissions = await getSubmissions();
+  for (const sub of submissions) {
+    if (sub.videoFileId) {
+      try {
+        await bucket.delete(new ObjectId(sub.videoFileId));
+      } catch (err) {
+        console.error('Error deleting video:', err);
+      }
+    }
+  }
+  await db.collection('submissions').deleteMany({});
+}
+
+async function getStorageStats() {
+  const files = await db.collection('fs.files').find({}).toArray();
+  const usedBytes = files.reduce((sum, f) => sum + (f.length || 0), 0);
+  const totalBytes = 512 * 1024 * 1024; // 512 MB Atlas free tier limit
+  return {
+    usedBytes,
+    totalBytes,
+    usedMB: Math.round(usedBytes / (1024 * 1024) * 10) / 10,
+    totalMB: 512,
+    percentage: Math.round((usedBytes / totalBytes) * 100),
+    fileCount: files.length,
+  };
+}
+
+// Migration: move submissions from appData to separate collection
+async function migrateSubmissions() {
+  const appData = await db.collection('appData').findOne({ _id: 'main' });
+  if (!appData || !appData.submissions || appData.submissions.length === 0) {
+    return;
+  }
+
+  // Check if we already have submissions in the new collection
+  const existingCount = await db.collection('submissions').countDocuments();
+  if (existingCount > 0) {
+    console.log('Submissions already migrated, skipping');
+    return;
+  }
+
+  console.log(`Migrating ${appData.submissions.length} submissions to new collection...`);
+  for (const sub of appData.submissions) {
+    await db.collection('submissions').insertOne({
+      ...sub,
+      _id: new ObjectId(),
+    });
+  }
+
+  // Remove submissions from appData (keep other fields)
+  await db.collection('appData').updateOne(
+    { _id: 'main' },
+    { $unset: { submissions: '' } }
+  );
+
+  console.log('Migration complete');
+}
+
+// Discord notifications
+async function sendDiscord(message, mentionVictor = false) {
+  if (!CONFIG.DISCORD_WEBHOOK_URL) {
+    console.log(`[DISCORD NOT CONFIGURED] ${message}`);
     return false;
   }
   try {
-    await emailTransporter.sendMail({
-      from: CONFIG.SMTP_USER,
-      to,
-      subject,
-      html,
+    const content = mentionVictor
+      ? `<@${CONFIG.VICTOR_DISCORD_ID}> ${message}`
+      : message;
+
+    await fetch(CONFIG.DISCORD_WEBHOOK_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content }),
     });
-    console.log(`Email sent to ${to}: ${subject}`);
+    console.log(`[DISCORD] Sent: ${message.substring(0, 50)}...`);
     return true;
   } catch (err) {
-    console.error('Email error:', err);
+    console.error('Discord error:', err);
     return false;
   }
 }
 
-// Session setup
+// Session setup with MongoDB store (persists across server restarts)
 app.use(session({
   secret: CONFIG.SESSION_SECRET,
   resave: false,
   saveUninitialized: false,
+  store: MongoStore.create({
+    mongoUrl: process.env.MONGODB_URI,
+    ttl: 7 * 24 * 60 * 60, // 1 week in seconds
+  }),
   cookie: {
     secure: process.env.NODE_ENV === 'production',
     httpOnly: true,
@@ -139,6 +219,11 @@ app.set('trust proxy', 1);
 app.use(express.static('public'));
 app.use(express.json());
 
+// Health check endpoint for uptime monitoring (e.g., UptimeRobot)
+app.get('/health', (req, res) => {
+  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+});
+
 // Secure weekly code generation using HMAC
 function getWeeklyCode() {
   const now = new Date();
@@ -161,6 +246,15 @@ function getCurrentWeek() {
   return `${year}-W${weekNum}`;
 }
 
+function getPreviousWeek() {
+  const now = new Date();
+  const lastWeek = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+  const year = lastWeek.getFullYear();
+  const startOfYear = new Date(year, 0, 1);
+  const weekNum = Math.ceil(((lastWeek - startOfYear) / 86400000 + startOfYear.getDay() + 1) / 7);
+  return `${year}-W${weekNum}`;
+}
+
 function getDeadline() {
   // Deadline is Monday 12 AM (Sunday midnight)
   const now = new Date();
@@ -173,15 +267,15 @@ function getDeadline() {
 }
 
 async function hasApprovedSubmissionThisWeek() {
-  const data = await getData();
   const currentWeek = getCurrentWeek();
-  return data.submissions.some(s => s.week === currentWeek && s.status === 'approved');
+  const submission = await db.collection('submissions').findOne({ week: currentWeek, status: 'approved' });
+  return !!submission;
 }
 
 async function hasPendingSubmissionThisWeek() {
-  const data = await getData();
   const currentWeek = getCurrentWeek();
-  return data.submissions.some(s => s.week === currentWeek && s.status === 'pending');
+  const submission = await db.collection('submissions').findOne({ week: currentWeek, status: 'pending' });
+  return !!submission;
 }
 
 // Auth middleware
@@ -288,7 +382,14 @@ app.get('/api/dashboard', requireAuth, async (req, res) => {
   const deadline = getDeadline();
   const currentWeek = getCurrentWeek();
 
-  const thisWeekSubmission = data.submissions.find(s => s.week === currentWeek);
+  // Get submissions from new collection
+  const allSubmissions = await getSubmissions();
+  const thisWeekSubmission = allSubmissions.find(s => s.week === currentWeek);
+
+  // Filter submissions based on role
+  const visibleSubmissions = req.session.user.role === 'admin'
+    ? allSubmissions.slice(0, 10)
+    : allSubmissions.filter(s => s.week === currentWeek);
 
   res.json({
     weeklyCode: getWeeklyCode(),
@@ -298,10 +399,7 @@ app.get('/api/dashboard', requireAuth, async (req, res) => {
     weeksUntilWedding: Math.max(0, weeksUntilWedding),
     streak: data.streak || 0,
     thisWeekStatus: thisWeekSubmission ? thisWeekSubmission.status : 'not_submitted',
-    submissions: data.submissions
-      .filter(s => req.session.user.role === 'admin' || s.week === currentWeek)
-      .slice(-10)
-      .reverse(),
+    submissions: visibleSubmissions,
     weddingDate: CONFIG.WEDDING_DATE.toISOString(),
     isSaturday: now.getDay() === 6,
     role: req.session.user.role,
@@ -356,10 +454,12 @@ app.post('/api/submit', requireAuth, upload.single('video'), async (req, res) =>
   const weeklyCode = getWeeklyCode();
   console.log(`[SUBMIT] Week: ${currentWeek}, Code: ${weeklyCode}`);
 
-  // Check if already has pending or approved submission
-  const data = await getData();
-  const existing = data.submissions.find(s => s.week === currentWeek);
-  if (existing && (existing.status === 'approved' || existing.status === 'pending')) {
+  // Check if already has pending or approved submission (using new collection)
+  const existing = await db.collection('submissions').findOne({
+    week: currentWeek,
+    status: { $in: ['approved', 'pending'] }
+  });
+  if (existing) {
     console.log(`[SUBMIT] Rejected: already ${existing.status} for this week`);
     fs.unlinkSync(req.file.path);
     return res.status(400).json({
@@ -376,24 +476,47 @@ app.post('/api/submit', requireAuth, upload.single('video'), async (req, res) =>
     const rejectToken = generateApprovalToken(submissionId, 'reject');
     console.log(`[SUBMIT] Generated submission ID: ${submissionId}`);
 
-    // Compress video for email
+    // Compress video
     const compressedPath = req.file.path.replace(/\.[^.]+$/, '_compressed.mp4');
     console.log('[SUBMIT] Starting video compression...');
     const compressionSuccess = compressVideo(req.file.path, compressedPath);
     console.log(`[SUBMIT] Compression ${compressionSuccess ? 'succeeded' : 'failed/skipped'}`);
 
-    // Save submission as pending (no video path stored since we email it)
-    const submission = {
-      id: submissionId,
-      week: currentWeek,
-      submittedAt: new Date().toISOString(),
-      status: 'pending',
-    };
+    // Determine which video file to store (compressed if available)
+    const videoToStore = compressionSuccess && fs.existsSync(compressedPath) ? compressedPath : req.file.path;
+    const videoSize = fs.statSync(videoToStore).size;
+    console.log(`[SUBMIT] Storing video: ${(videoSize / 1024 / 1024).toFixed(1)}MB`);
+
+    // Store video in GridFS
+    const videoFileId = new ObjectId();
+    const uploadStream = bucket.openUploadStreamWithId(videoFileId, `practice-${currentWeek}.mp4`, {
+      contentType: 'video/mp4',
+      metadata: { submissionId, week: currentWeek }
+    });
+
+    const videoBuffer = fs.readFileSync(videoToStore);
+    uploadStream.end(videoBuffer);
+
+    await new Promise((resolve, reject) => {
+      uploadStream.on('finish', resolve);
+      uploadStream.on('error', reject);
+    });
+    console.log(`[SUBMIT] Video stored in GridFS: ${videoFileId}`);
 
     // Remove old rejected submission for this week if exists
-    data.submissions = data.submissions.filter(s => !(s.week === currentWeek && s.status === 'rejected'));
-    data.submissions.push(submission);
-    await saveData(data);
+    await db.collection('submissions').deleteMany({ week: currentWeek, status: 'rejected' });
+
+    // Save submission to new collection
+    const submission = {
+      _id: new ObjectId(),
+      id: submissionId,
+      week: currentWeek,
+      submittedAt: new Date(),
+      status: 'pending',
+      videoFileId: videoFileId.toString(),
+      videoSize,
+    };
+    await saveSubmission(submission);
 
     // Build approval links
     const baseUrl = process.env.APP_URL || `http://localhost:${PORT}`;
@@ -405,7 +528,7 @@ app.post('/api/submit', requireAuth, upload.single('video'), async (req, res) =>
       <p><strong>Week:</strong> ${currentWeek}<br>
       <strong>Expected code:</strong> ${weeklyCode}</p>
 
-      <p>Video is attached. Please verify:</p>
+      <p>Video available in admin dashboard. Please verify:</p>
       <ul>
         <li>The code "${weeklyCode}" is visible on paper in the video</li>
         <li>It's a real video of Victor practicing</li>
@@ -416,7 +539,7 @@ app.post('/api/submit', requireAuth, upload.single('video'), async (req, res) =>
         <a href="${rejectLink}" style="background:#ef4444;color:white;padding:12px 24px;text-decoration:none;border-radius:6px;display:inline-block;">❌ REJECT</a>
       </div>
 
-      <p style="color:#666;font-size:0.875rem;">Click a button above to approve or reject this submission.</p>
+      <p style="color:#666;font-size:0.875rem;">Or view the video and approve/reject in the <a href="${baseUrl}">admin dashboard</a>.</p>
     `;
 
     // Send response immediately so user doesn't wait
@@ -425,45 +548,11 @@ app.post('/api/submit', requireAuth, upload.single('video'), async (req, res) =>
       message: 'Submitted for review',
     });
 
-    // Send email with attachment (async, after response)
-    const videoToAttach = compressionSuccess && fs.existsSync(compressedPath) ? compressedPath : req.file.path;
-    const attachmentSize = fs.statSync(videoToAttach).size;
-    const videoTooLarge = attachmentSize >= 25 * 1024 * 1024;
+    // Send Discord notification (async, after response)
+    console.log('[SUBMIT] Sending Discord notification...');
+    await sendDiscord(`🎻 **New Practice Video Submitted** - ${currentWeek}\nReview it here: ${baseUrl}`);
 
-    const finalEmailHtml = videoTooLarge
-      ? emailHtml.replace('Video is attached.', '<strong>Note: Video too large to attach (over 25MB). Please request it from Victor.</strong>')
-      : emailHtml;
-
-    console.log('[SUBMIT] About to send email...');
-    console.log(`[SUBMIT] Email transporter exists: ${!!emailTransporter}`);
-    console.log(`[SUBMIT] Admin email: ${CONFIG.ADMIN_EMAIL}`);
-    console.log(`[SUBMIT] Video too large for attachment: ${videoTooLarge}`);
-    console.log(`[SUBMIT] Attachment size: ${(attachmentSize / 1024 / 1024).toFixed(1)}MB`);
-
-    if (emailTransporter) {
-      try {
-        console.log('[SUBMIT] Calling sendMail...');
-        await emailTransporter.sendMail({
-          from: CONFIG.SMTP_USER,
-          to: CONFIG.ADMIN_EMAIL,
-          subject: `🎻 Practice Video - ${currentWeek}${videoTooLarge ? ' (no attachment)' : ''}`,
-          html: finalEmailHtml,
-          attachments: !videoTooLarge ? [{
-            filename: `practice-${currentWeek}.mp4`,
-            path: videoToAttach,
-          }] : [],
-        });
-        console.log(`[SUBMIT] Email sent successfully to ${CONFIG.ADMIN_EMAIL}`);
-      } catch (emailErr) {
-        console.error('[SUBMIT] Email error:', emailErr.message);
-        console.error('[SUBMIT] Email error code:', emailErr.code);
-        console.error('[SUBMIT] Full error:', emailErr);
-      }
-    } else {
-      console.log(`[SUBMIT] EMAIL NOT CONFIGURED - Would send to: ${CONFIG.ADMIN_EMAIL}`);
-    }
-
-    // Clean up video files after sending
+    // Clean up local video files
     try {
       fs.unlinkSync(req.file.path);
       if (compressionSuccess && fs.existsSync(compressedPath)) {
@@ -502,8 +591,8 @@ app.get('/api/review', async (req, res) => {
     return res.status(403).send(htmlResponse('Invalid Token', 'This approval link is invalid.', 'error'));
   }
 
-  const data = await getData();
-  const submission = data.submissions.find(s => s.id === id);
+  // Get submission from new collection
+  const submission = await getSubmissionById(id);
 
   if (!submission) {
     return res.status(404).send(htmlResponse('Not Found', 'Submission not found.', 'error'));
@@ -513,13 +602,17 @@ app.get('/api/review', async (req, res) => {
     return res.send(htmlResponse('Already Reviewed', `This submission was already ${submission.status}.`, 'info'));
   }
 
-  submission.status = action === 'approve' ? 'approved' : 'rejected';
-  submission.reviewedAt = new Date().toISOString();
+  // Update submission status
+  await updateSubmission(id, {
+    status: action === 'approve' ? 'approved' : 'rejected',
+    reviewedAt: new Date(),
+  });
 
+  // Update streak in appData
+  const data = await getData();
   if (action === 'approve') {
     data.streak = (data.streak || 0) + 1;
   }
-
   await saveData(data);
 
   // Notify Victor of result
@@ -528,11 +621,7 @@ app.get('/api/review', async (req, res) => {
     ? `Great job! Your practice video for ${submission.week} has been approved. Your streak is now ${data.streak} weeks!`
     : `Your practice video for ${submission.week} was rejected. Please submit a new video.`;
 
-  await sendEmail(
-    CONFIG.FRIEND_EMAIL,
-    `${resultEmoji} Practice Video ${action === 'approve' ? 'Approved' : 'Rejected'} - ${submission.week}`,
-    `<p>${resultText}</p>`
-  );
+  await sendDiscord(`${resultEmoji} ${resultText}`, true);
 
   const title = action === 'approve' ? 'Approved!' : 'Rejected';
   const message = action === 'approve'
@@ -565,8 +654,8 @@ app.get('/api/admin/deadline-status', requireAdmin, async (req, res) => {
   const deadline = getDeadline();
   const now = new Date();
 
-  const hasApproved = data.submissions.some(s => s.week === currentWeek && s.status === 'approved');
-  const hasPending = data.submissions.some(s => s.week === currentWeek && s.status === 'pending');
+  const hasApproved = await hasApprovedSubmissionThisWeek();
+  const hasPending = await hasPendingSubmissionThisWeek();
   const deadlinePassed = now > deadline;
 
   const canTriggerConsequence = deadlinePassed && !hasApproved;
@@ -601,15 +690,8 @@ app.post('/api/admin/trigger-consequence', requireAdmin, async (req, res) => {
 
   const paypalLink = `https://paypal.me/${CONFIG.PAYPAL_ME_USERNAME}/${CONFIG.CONSEQUENCE_AMOUNT}`;
 
-  // Email friend about consequence
-  await sendEmail(
-    CONFIG.FRIEND_EMAIL,
-    'Practice Deadline Missed - Consequence Triggered',
-    `<p>You missed the practice deadline for ${currentWeek}.</p>
-    <p>As agreed, you owe $${CONFIG.CONSEQUENCE_AMOUNT}.</p>
-    <p><a href="${paypalLink}" style="background: #0070ba; color: white; padding: 12px 24px; text-decoration: none; border-radius: 4px;">Pay $${CONFIG.CONSEQUENCE_AMOUNT} via PayPal</a></p>
-    <p>Your streak has been reset to 0. Don't let this happen again!</p>`
-  );
+  // Notify Victor about consequence
+  await sendDiscord(`🚨 **DEADLINE MISSED** - ${currentWeek}\n\nYou missed the practice deadline. You owe $${CONFIG.CONSEQUENCE_AMOUNT}.\n\n💰 Pay here: ${paypalLink}\n\nYour streak has been reset to 0. Don't let this happen again!`, true);
 
   res.json({
     success: true,
@@ -618,79 +700,237 @@ app.post('/api/admin/trigger-consequence', requireAdmin, async (req, res) => {
   });
 });
 
-// Saturday reminder cron endpoint (call this via external cron service)
-app.post('/api/cron/saturday-reminder', async (req, res) => {
-  const cronSecret = req.headers['x-cron-secret'];
-  if (cronSecret !== process.env.CRON_SECRET) {
-    return res.status(403).json({ error: 'Invalid cron secret' });
+// Video streaming endpoint (admin only)
+app.get('/api/videos/:id', requireAdmin, async (req, res) => {
+  const submissionId = req.params.id;
+  const submission = await getSubmissionById(submissionId);
+
+  if (!submission || !submission.videoFileId) {
+    return res.status(404).json({ error: 'Video not found' });
   }
 
-  const now = new Date();
-  if (now.getDay() !== 6) {
-    return res.json({ skipped: true, reason: 'Not Saturday' });
+  try {
+    const fileId = new ObjectId(submission.videoFileId);
+    const files = await db.collection('fs.files').find({ _id: fileId }).toArray();
+
+    if (files.length === 0) {
+      return res.status(404).json({ error: 'Video file not found' });
+    }
+
+    const file = files[0];
+    const fileSize = file.length;
+
+    // Handle range requests for video seeking
+    const range = req.headers.range;
+    if (range) {
+      const parts = range.replace(/bytes=/, '').split('-');
+      const start = parseInt(parts[0], 10);
+      const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
+      const chunkSize = end - start + 1;
+
+      res.writeHead(206, {
+        'Content-Range': `bytes ${start}-${end}/${fileSize}`,
+        'Accept-Ranges': 'bytes',
+        'Content-Length': chunkSize,
+        'Content-Type': 'video/mp4',
+      });
+
+      const downloadStream = bucket.openDownloadStream(fileId, { start, end: end + 1 });
+      downloadStream.pipe(res);
+    } else {
+      res.writeHead(200, {
+        'Content-Length': fileSize,
+        'Content-Type': 'video/mp4',
+      });
+
+      const downloadStream = bucket.openDownloadStream(fileId);
+      downloadStream.pipe(res);
+    }
+  } catch (err) {
+    console.error('Video streaming error:', err);
+    res.status(500).json({ error: 'Failed to stream video' });
   }
+});
+
+// Storage stats endpoint
+app.get('/api/admin/storage', requireAdmin, async (req, res) => {
+  try {
+    const stats = await getStorageStats();
+    res.json(stats);
+  } catch (err) {
+    console.error('Storage stats error:', err);
+    res.status(500).json({ error: 'Failed to get storage stats' });
+  }
+});
+
+// List all submissions (admin only)
+app.get('/api/admin/submissions', requireAdmin, async (req, res) => {
+  try {
+    const submissions = await getSubmissions();
+    res.json(submissions);
+  } catch (err) {
+    console.error('Submissions listing error:', err);
+    res.status(500).json({ error: 'Failed to list submissions' });
+  }
+});
+
+// In-app approve submission
+app.post('/api/admin/submissions/:id/approve', requireAdmin, async (req, res) => {
+  const submissionId = req.params.id;
+  const submission = await getSubmissionById(submissionId);
+
+  if (!submission) {
+    return res.status(404).json({ error: 'Submission not found' });
+  }
+
+  if (submission.status !== 'pending') {
+    return res.status(400).json({ error: `Submission already ${submission.status}` });
+  }
+
+  await updateSubmission(submissionId, {
+    status: 'approved',
+    reviewedAt: new Date(),
+  });
+
+  // Update streak
+  const data = await getData();
+  data.streak = (data.streak || 0) + 1;
+  await saveData(data);
+
+  // Notify Victor
+  await sendDiscord(`✅ Great job! Your practice video for ${submission.week} has been approved. Your streak is now ${data.streak} weeks!`, true);
+
+  res.json({ success: true, streak: data.streak });
+});
+
+// In-app reject submission
+app.post('/api/admin/submissions/:id/reject', requireAdmin, async (req, res) => {
+  const submissionId = req.params.id;
+  const submission = await getSubmissionById(submissionId);
+
+  if (!submission) {
+    return res.status(404).json({ error: 'Submission not found' });
+  }
+
+  if (submission.status !== 'pending') {
+    return res.status(400).json({ error: `Submission already ${submission.status}` });
+  }
+
+  await updateSubmission(submissionId, {
+    status: 'rejected',
+    reviewedAt: new Date(),
+  });
+
+  // Notify Victor
+  await sendDiscord(`❌ Your practice video for ${submission.week} was rejected. Please submit a new video.`, true);
+
+  res.json({ success: true });
+});
+
+// Delete single submission
+app.delete('/api/admin/submissions/:id', requireAdmin, async (req, res) => {
+  const submissionId = req.params.id;
+  const submission = await getSubmissionById(submissionId);
+
+  if (!submission) {
+    return res.status(404).json({ error: 'Submission not found' });
+  }
+
+  await deleteSubmission(submissionId);
+  res.json({ success: true });
+});
+
+// Clear all submissions
+app.delete('/api/admin/submissions', requireAdmin, async (req, res) => {
+  if (req.query.confirm !== 'true') {
+    return res.status(400).json({ error: 'Must confirm with ?confirm=true' });
+  }
+
+  await deleteAllSubmissions();
+
+  // Reset streak
+  const data = await getData();
+  data.streak = 0;
+  await saveData(data);
+
+  res.json({ success: true, message: 'All submissions cleared' });
+});
+
+// Scheduled task: Saturday reminder (10 AM)
+async function saturdayReminder() {
+  console.log('[CRON] Running Saturday reminder check...');
 
   if (await hasApprovedSubmissionThisWeek() || await hasPendingSubmissionThisWeek()) {
-    return res.json({ skipped: true, reason: 'Already submitted' });
+    console.log('[CRON] Already submitted this week, skipping reminder');
+    return;
   }
 
   const deadline = getDeadline();
   const weeklyCode = getWeeklyCode();
+  const appUrl = process.env.APP_URL || `http://localhost:${PORT}`;
 
-  await sendEmail(
-    CONFIG.FRIEND_EMAIL,
-    'Reminder: Practice Video Due Monday',
-    `<p>This is your Saturday reminder.</p>
-    <p>You haven't submitted your practice video yet this week.</p>
-    <p><strong>Deadline:</strong> ${deadline.toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric' })} at midnight</p>
-    <p><strong>This week's code:</strong> <code style="font-size: 18px; background: #f0f0f0; padding: 4px 8px;">${weeklyCode}</code></p>
-    <p>Write the code on paper and show it in your video.</p>
-    <p><a href="${process.env.APP_URL || 'http://localhost:' + PORT}">Submit your video</a></p>`
-  );
+  await sendDiscord(`⏰ **Saturday Reminder**\n\nYou haven't submitted your practice video yet this week!\n\n📅 **Deadline:** ${deadline.toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric' })} at midnight\n🔑 **This week's code:** \`${weeklyCode}\`\n\nWrite the code on paper and show it in your video.\n\n👉 Submit here: ${appUrl}`, true);
 
-  res.json({ success: true, sent: true });
-});
+  console.log('[CRON] Saturday reminder sent');
+}
 
-// Deadline check cron endpoint
-app.post('/api/cron/deadline-check', async (req, res) => {
-  const cronSecret = req.headers['x-cron-secret'];
-  if (cronSecret !== process.env.CRON_SECRET) {
-    return res.status(403).json({ error: 'Invalid cron secret' });
-  }
+// Scheduled task: Monday deadline check & automatic consequence (8 AM)
+async function mondayDeadlineCheck() {
+  console.log('[CRON] Running Monday deadline check...');
 
-  const deadline = getDeadline();
-  const now = new Date();
-
-  // Only alert on Monday after deadline
-  if (now.getDay() !== 1) {
-    return res.json({ skipped: true, reason: 'Not Monday' });
-  }
-
-  if (await hasApprovedSubmissionThisWeek()) {
-    return res.json({ skipped: true, reason: 'Already approved' });
-  }
-
-  const currentWeek = getCurrentWeek();
+  const previousWeek = getPreviousWeek();
   const data = await getData();
-  const alreadyTriggered = (data.consequencesTriggered || []).includes(currentWeek);
 
-  if (alreadyTriggered) {
-    return res.json({ skipped: true, reason: 'Already triggered' });
+  // Check if already triggered for previous week
+  if (!data.consequencesTriggered) data.consequencesTriggered = [];
+  if (data.consequencesTriggered.includes(previousWeek)) {
+    console.log(`[CRON] Consequence already triggered for ${previousWeek}`);
+    return;
   }
 
-  await sendEmail(
-    CONFIG.ADMIN_EMAIL,
-    'DEADLINE MISSED - Consequence Available',
-    `<p>The practice deadline has passed and no video was approved for ${currentWeek}.</p>
-    <p><a href="${process.env.APP_URL || 'http://localhost:' + PORT}" style="background: #dc3545; color: white; padding: 12px 24px; text-decoration: none; border-radius: 4px;">Trigger Consequence</a></p>`
-  );
+  // Check if previous week had an approved submission
+  const approvedSubmission = await db.collection('submissions').findOne({
+    week: previousWeek,
+    status: 'approved'
+  });
 
-  res.json({ success: true, alertSent: true });
-});
+  if (approvedSubmission) {
+    console.log(`[CRON] ${previousWeek} had approved submission, no consequence needed`);
+    return;
+  }
+
+  // Trigger consequence!
+  console.log(`[CRON] Triggering consequence for ${previousWeek}`);
+
+  data.streak = 0;
+  data.consequencesTriggered.push(previousWeek);
+  await saveData(data);
+
+  const paypalLink = `https://paypal.me/${CONFIG.PAYPAL_ME_USERNAME}/${CONFIG.CONSEQUENCE_AMOUNT}`;
+
+  await sendDiscord(`🚨 **DEADLINE MISSED** - ${previousWeek}\n\nYou missed the practice deadline. You owe $${CONFIG.CONSEQUENCE_AMOUNT}.\n\n💰 Pay here: ${paypalLink}\n\nYour streak has been reset to 0. Don't let this happen again!`, true);
+
+  console.log('[CRON] Consequence triggered and Victor notified');
+}
 
 // Initialize and start server
 connectDB().then(async () => {
+  await migrateSubmissions();
   await initializeUsers();
+
+  // Schedule automatic tasks
+  // Saturday at 10:00 AM - reminder
+  cron.schedule('0 10 * * 6', saturdayReminder, {
+    timezone: 'America/New_York'
+  });
+  console.log('[CRON] Saturday reminder scheduled for 10:00 AM');
+
+  // Monday at 8:00 AM - deadline check & consequence
+  cron.schedule('0 8 * * 1', mondayDeadlineCheck, {
+    timezone: 'America/New_York'
+  });
+  console.log('[CRON] Monday deadline check scheduled for 8:00 AM');
+
   app.listen(PORT, () => {
     console.log(`Server running at http://localhost:${PORT}`);
     console.log(`Wedding: ${CONFIG.WEDDING_DATE.toDateString()}`);

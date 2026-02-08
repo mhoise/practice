@@ -33,6 +33,26 @@
     .nav-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 2rem; }
     .nav-header h1 { margin: 0; }
     .saturday-warning { padding: 1rem; background: color-mix(in srgb, #f59e0b 15%, transparent); border-radius: var(--pico-border-radius); margin-bottom: 1rem; }
+    .storage-indicator { margin-bottom: 1.5rem; }
+    .storage-bar { height: 8px; background: var(--pico-muted-border-color); border-radius: 4px; overflow: hidden; margin-bottom: 0.5rem; }
+    .storage-used { height: 100%; background: var(--pico-primary); transition: width 0.3s; }
+    .storage-used.warning { background: #f59e0b; }
+    .storage-used.critical { background: var(--pico-del-color); }
+    .storage-text { font-size: 0.875rem; color: var(--pico-muted-color); }
+    .submissions-list { margin-top: 1.5rem; }
+    .submission-card { padding: 1rem; margin-bottom: 1rem; background: var(--pico-card-background-color); border-radius: var(--pico-border-radius); border: 1px solid var(--pico-muted-border-color); }
+    .submission-card.pending { border-left: 4px solid #f59e0b; }
+    .submission-card.approved { border-left: 4px solid var(--pico-ins-color); }
+    .submission-card.rejected { border-left: 4px solid var(--pico-del-color); }
+    .submission-meta { display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.5rem; flex-wrap: wrap; gap: 0.5rem; }
+    .submission-week { font-weight: 600; }
+    .submission-size { font-size: 0.875rem; color: var(--pico-muted-color); }
+    .submission-actions { display: flex; gap: 0.5rem; flex-wrap: wrap; margin-top: 1rem; }
+    .submission-actions button { flex: 1; min-width: 80px; padding: 0.5rem 1rem; font-size: 0.875rem; }
+    .danger-zone { margin-top: 2rem; }
+    .danger-zone summary { cursor: pointer; color: var(--pico-del-color); font-weight: 600; }
+    .danger-zone-content { padding: 1rem; margin-top: 1rem; background: color-mix(in srgb, var(--pico-del-color) 10%, transparent); border: 1px solid var(--pico-del-color); border-radius: var(--pico-border-radius); }
+    .danger-zone-content p { margin-bottom: 1rem; color: var(--pico-muted-color); }
   </style>
 </head>
 <body>
@@ -101,6 +121,14 @@
         <h2>This Week</h2>
         <p id="submission-status"></p>
       </section>
+
+      <section id="well-done-section" class="hidden">
+        <div style="text-align: center; padding: 2rem 0;">
+          <div style="font-size: 4rem; margin-bottom: 1rem;">🎉</div>
+          <h2 style="color: var(--pico-ins-color); margin-bottom: 0.5rem;">Well Done!</h2>
+          <p style="color: var(--pico-muted-color);">Your practice video has been approved. See you next week!</p>
+        </div>
+      </section>
     </section>
 
     <!-- Admin View -->
@@ -125,6 +153,14 @@
         </div>
       </div>
 
+      <!-- Storage Indicator -->
+      <div class="storage-indicator">
+        <div class="storage-bar">
+          <div class="storage-used" id="storage-bar-fill" style="width: 0%"></div>
+        </div>
+        <span class="storage-text" id="storage-text">Loading storage...</span>
+      </div>
+
       <div id="consequence-section" class="consequence-box hidden">
         <h3>Deadline Missed</h3>
         <p>No approved submission this week. You can trigger the consequence.</p>
@@ -137,7 +173,22 @@
         <p id="admin-week-status">Loading...</p>
       </div>
 
-      <p style="color: var(--pico-muted-color); text-align: center;">Video reviews are sent via email with approve/reject links.</p>
+      <!-- Submissions List -->
+      <div class="submissions-list">
+        <h3>All Submissions</h3>
+        <div id="submissions-container">
+          <p style="color: var(--pico-muted-color);">Loading submissions...</p>
+        </div>
+      </div>
+
+      <!-- Danger Zone -->
+      <details class="danger-zone">
+        <summary>Danger Zone</summary>
+        <div class="danger-zone-content">
+          <p>These actions are irreversible. Use with caution.</p>
+          <button id="clear-all-btn" class="contrast">Clear All Submissions</button>
+        </div>
+      </details>
     </section>
   </main>
 
@@ -223,28 +274,29 @@
 
         const submitSection = document.getElementById('submit-section');
         const alreadySection = document.getElementById('already-submitted');
+        const wellDoneSection = document.getElementById('well-done-section');
         const statusEl = document.getElementById('submission-status');
 
-        if (data.thisWeekStatus === 'not_submitted') {
+        // Hide all sections first
+        submitSection.classList.add('hidden');
+        alreadySection.classList.add('hidden');
+        wellDoneSection.classList.add('hidden');
+
+        if (data.thisWeekStatus === 'approved') {
+          // Show well done section
+          wellDoneSection.classList.remove('hidden');
+        } else if (data.thisWeekStatus === 'not_submitted') {
           submitSection.classList.remove('hidden');
-          alreadySection.classList.add('hidden');
           const deadline = new Date(data.deadline);
           document.getElementById('week-status').innerHTML =
             `Due by ${deadline.toLocaleDateString('en-US', { weekday: 'long', month: 'short', day: 'numeric' })} at midnight`;
-        } else {
-          submitSection.classList.add('hidden');
+        } else if (data.thisWeekStatus === 'pending') {
           alreadySection.classList.remove('hidden');
-          const statusClass = `status-${data.thisWeekStatus}`;
-          const statusText = {
-            pending: 'Submitted - waiting for review',
-            approved: 'Approved for this week',
-            rejected: 'Rejected - you can submit again',
-          }[data.thisWeekStatus];
-          statusEl.innerHTML = `<span class="${statusClass}">${statusText}</span>`;
-
-          if (data.thisWeekStatus === 'rejected') {
-            submitSection.classList.remove('hidden');
-          }
+          statusEl.innerHTML = `<span class="status-pending">Submitted - waiting for review</span>`;
+        } else if (data.thisWeekStatus === 'rejected') {
+          alreadySection.classList.remove('hidden');
+          submitSection.classList.remove('hidden');
+          statusEl.innerHTML = `<span class="status-rejected">Rejected - you can submit again</span>`;
         }
       } catch (err) {
         console.error('Dashboard error:', err);
@@ -300,32 +352,44 @@
     // Admin dashboard
     async function loadAdminDashboard() {
       try {
-        const res = await fetch('/api/dashboard');
-        if (!res.ok) {
-          console.error('Dashboard API error:', res.status);
+        const [dashRes, deadlineRes, storageRes, subsRes] = await Promise.all([
+          fetch('/api/dashboard'),
+          fetch('/api/admin/deadline-status'),
+          fetch('/api/admin/storage'),
+          fetch('/api/admin/submissions')
+        ]);
+
+        if (!dashRes.ok || !deadlineRes.ok) {
+          console.error('Dashboard API error');
           return;
         }
-        const data = await res.json();
+
+        const data = await dashRes.json();
+        const deadlineData = await deadlineRes.json();
+        const storageData = storageRes.ok ? await storageRes.json() : null;
+        const submissions = subsRes.ok ? await subsRes.json() : [];
 
         document.getElementById('admin-streak').textContent = data.streak ?? 0;
         document.getElementById('admin-days-left').textContent = data.daysUntilWedding ?? 0;
-
-        // Get deadline status
-        const deadlineRes = await fetch('/api/admin/deadline-status');
-        if (!deadlineRes.ok) {
-          console.error('Deadline API error:', deadlineRes.status);
-          return;
-        }
-        const deadlineData = await deadlineRes.json();
-
         document.getElementById('consequences-count').textContent = deadlineData.alreadyTriggered ? '1+' : '0';
+
+        // Storage indicator
+        if (storageData) {
+          const storageBar = document.getElementById('storage-bar-fill');
+          const storageText = document.getElementById('storage-text');
+          storageBar.style.width = `${Math.min(storageData.percentage, 100)}%`;
+          storageBar.classList.remove('warning', 'critical');
+          if (storageData.percentage >= 90) storageBar.classList.add('critical');
+          else if (storageData.percentage >= 80) storageBar.classList.add('warning');
+          storageText.textContent = `${storageData.usedMB} MB / ${storageData.totalMB} MB (${storageData.percentage}%) - ${storageData.fileCount} videos`;
+        }
 
         // This week status
         const statusEl = document.getElementById('admin-week-status');
         const statusClass = `status-${data.thisWeekStatus || 'not_submitted'}`;
         const statusText = {
           not_submitted: 'No submission yet',
-          pending: 'Submitted - check your email to review',
+          pending: 'Pending review',
           approved: 'Approved',
           rejected: 'Rejected - waiting for resubmission',
         }[data.thisWeekStatus] || 'No submission yet';
@@ -339,10 +403,128 @@
           consequenceSection.classList.add('hidden');
         }
 
+        // Render submissions list
+        renderSubmissions(submissions, data.currentWeek);
+
       } catch (err) {
         console.error('Admin dashboard error:', err);
       }
     }
+
+    function renderSubmissions(submissions, currentWeek) {
+      const container = document.getElementById('submissions-container');
+
+      if (submissions.length === 0) {
+        container.innerHTML = '<p style="color: var(--pico-muted-color);">No submissions yet.</p>';
+        return;
+      }
+
+      container.innerHTML = submissions.map(sub => {
+        const date = new Date(sub.submittedAt);
+        const dateStr = date.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+        const sizeStr = sub.videoSize ? `${(sub.videoSize / 1024 / 1024).toFixed(1)} MB` : '';
+        const isCurrentWeek = sub.week === currentWeek;
+
+        const statusBadge = {
+          pending: '<span class="status-pending">Pending</span>',
+          approved: '<span class="status-approved">Approved</span>',
+          rejected: '<span class="status-rejected">Rejected</span>',
+        }[sub.status] || '';
+
+        const actionButtons = sub.status === 'pending' ? `
+          <button class="secondary" onclick="approveSubmission('${sub.id}')">Approve</button>
+          <button class="secondary" onclick="rejectSubmission('${sub.id}')">Reject</button>
+        ` : '';
+
+        return `
+          <div class="submission-card ${sub.status}">
+            <div class="submission-meta">
+              <span class="submission-week">${sub.week}${isCurrentWeek ? ' (current)' : ''}</span>
+              <span>${statusBadge}</span>
+            </div>
+            <div style="font-size: 0.875rem; color: var(--pico-muted-color); margin-bottom: 0.5rem;">
+              Submitted: ${dateStr} ${sizeStr ? `| ${sizeStr}` : ''}
+            </div>
+            ${sub.videoFileId ? `
+              <video controls preload="metadata">
+                <source src="/api/videos/${sub.id}" type="video/mp4">
+                Your browser does not support video playback.
+              </video>
+            ` : '<p style="color: var(--pico-muted-color);">No video available</p>'}
+            <div class="submission-actions">
+              ${actionButtons}
+              <button class="outline contrast" onclick="deleteSubmission('${sub.id}')">Delete</button>
+            </div>
+          </div>
+        `;
+      }).join('');
+    }
+
+    async function approveSubmission(id) {
+      if (!confirm('Approve this submission?')) return;
+      try {
+        const res = await fetch(`/api/admin/submissions/${id}/approve`, { method: 'POST' });
+        if (res.ok) {
+          loadAdminDashboard();
+        } else {
+          const data = await res.json();
+          alert(data.error || 'Failed to approve');
+        }
+      } catch {
+        alert('Failed to approve submission');
+      }
+    }
+
+    async function rejectSubmission(id) {
+      if (!confirm('Reject this submission?')) return;
+      try {
+        const res = await fetch(`/api/admin/submissions/${id}/reject`, { method: 'POST' });
+        if (res.ok) {
+          loadAdminDashboard();
+        } else {
+          const data = await res.json();
+          alert(data.error || 'Failed to reject');
+        }
+      } catch {
+        alert('Failed to reject submission');
+      }
+    }
+
+    async function deleteSubmission(id) {
+      if (!confirm('Delete this submission? This will also delete the video. This cannot be undone.')) return;
+      try {
+        const res = await fetch(`/api/admin/submissions/${id}`, { method: 'DELETE' });
+        if (res.ok) {
+          loadAdminDashboard();
+        } else {
+          const data = await res.json();
+          alert(data.error || 'Failed to delete');
+        }
+      } catch {
+        alert('Failed to delete submission');
+      }
+    }
+
+    document.getElementById('clear-all-btn').addEventListener('click', async () => {
+      const confirmation = prompt('Type "DELETE ALL" to confirm clearing all submissions and videos:');
+      if (confirmation !== 'DELETE ALL') {
+        alert('Cancelled. You must type "DELETE ALL" exactly.');
+        return;
+      }
+
+      try {
+        const res = await fetch('/api/admin/submissions?confirm=true', { method: 'DELETE' });
+        if (res.ok) {
+          alert('All submissions cleared.');
+          loadAdminDashboard();
+        } else {
+          const data = await res.json();
+          alert(data.error || 'Failed to clear submissions');
+        }
+      } catch {
+        alert('Failed to clear submissions');
+      }
+    });
 
     document.getElementById('trigger-consequence-btn').addEventListener('click', async () => {
       if (!confirm('Trigger consequence? This will reset the streak and notify Victor to pay $5.')) {
