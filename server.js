@@ -152,6 +152,29 @@ async function migrateSubmissions() {
   console.log('Migration complete');
 }
 
+// Fix week tags: recalculate using ISO weeks (Monday-based) with Eastern timezone
+async function fixWeekTags() {
+  const submissions = await getSubmissions();
+  let fixed = 0;
+  for (const sub of submissions) {
+    if (sub.submittedAt) {
+      const submittedDate = new Date(
+        new Date(sub.submittedAt).toLocaleString('en-US', { timeZone: 'America/New_York' })
+      );
+      const { year, week } = getISOWeek(submittedDate);
+      const correctWeek = `${year}-W${week}`;
+      if (sub.week !== correctWeek) {
+        console.log(`[MIGRATION] Fixing week tag: ${sub.id} ${sub.week} -> ${correctWeek}`);
+        await updateSubmission(sub.id, { week: correctWeek });
+        fixed++;
+      }
+    }
+  }
+  if (fixed > 0) {
+    console.log(`[MIGRATION] Fixed ${fixed} submission week tags`);
+  }
+}
+
 // Discord notifications
 async function sendDiscord(message, mentionVictor = false) {
   if (!CONFIG.DISCORD_WEBHOOK_URL) {
@@ -224,41 +247,50 @@ app.get('/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
-// Secure weekly code generation using HMAC
-function getWeeklyCode() {
-  const now = new Date();
-  const year = now.getFullYear();
-  const startOfYear = new Date(year, 0, 1);
-  const weekNum = Math.ceil(((now - startOfYear) / 86400000 + startOfYear.getDay() + 1) / 7);
+// Get current date/time in Eastern timezone (all date logic uses ET)
+function getEasternNow() {
+  return new Date(new Date().toLocaleString('en-US', { timeZone: 'America/New_York' }));
+}
 
-  const hmac = crypto.createHmac('sha256', CONFIG.CODE_SECRET);
-  hmac.update(`${year}-${weekNum}`);
-  const hash = hmac.digest('hex').substring(0, 6).toUpperCase();
-
-  return `VIOLIN-${hash}`;
+// ISO 8601 week number (Monday-based: Mon=1 through Sun=7)
+// This aligns with the Monday deadline cycle
+function getISOWeek(date) {
+  const d = new Date(date);
+  d.setHours(0, 0, 0, 0);
+  const dayNum = d.getDay() || 7; // Convert Sunday from 0 to 7
+  d.setDate(d.getDate() + 4 - dayNum); // Set to Thursday of this week
+  const yearStart = new Date(d.getFullYear(), 0, 1);
+  const weekNo = Math.ceil((((d - yearStart) / 86400000) + 1) / 7);
+  return { year: d.getFullYear(), week: weekNo };
 }
 
 function getCurrentWeek() {
-  const now = new Date();
-  const year = now.getFullYear();
-  const startOfYear = new Date(year, 0, 1);
-  const weekNum = Math.ceil(((now - startOfYear) / 86400000 + startOfYear.getDay() + 1) / 7);
-  return `${year}-W${weekNum}`;
+  const now = getEasternNow();
+  const { year, week } = getISOWeek(now);
+  return `${year}-W${week}`;
 }
 
 function getPreviousWeek() {
-  const now = new Date();
-  const lastWeek = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
-  const year = lastWeek.getFullYear();
-  const startOfYear = new Date(year, 0, 1);
-  const weekNum = Math.ceil(((lastWeek - startOfYear) / 86400000 + startOfYear.getDay() + 1) / 7);
-  return `${year}-W${weekNum}`;
+  const now = getEasternNow();
+  const lastWeek = new Date(now);
+  lastWeek.setDate(lastWeek.getDate() - 7);
+  const { year, week } = getISOWeek(lastWeek);
+  return `${year}-W${week}`;
+}
+
+// Secure weekly code generation using HMAC
+function getWeeklyCode() {
+  const week = getCurrentWeek();
+  const hmac = crypto.createHmac('sha256', CONFIG.CODE_SECRET);
+  hmac.update(week);
+  const hash = hmac.digest('hex').substring(0, 6).toUpperCase();
+  return `VIOLIN-${hash}`;
 }
 
 function getDeadline() {
-  // Deadline is Monday 12 AM (Sunday midnight)
-  const now = new Date();
-  const day = now.getDay(); // 0 = Sunday
+  // Deadline is Monday 12:00 AM ET (end of Sunday)
+  const now = getEasternNow();
+  const day = now.getDay(); // 0=Sun, 1=Mon, ...
   const daysUntilMonday = day === 0 ? 1 : (8 - day) % 7 || 7;
   const deadline = new Date(now);
   deadline.setDate(deadline.getDate() + daysUntilMonday);
@@ -651,47 +683,53 @@ h1{color:${colors[type]};margin-bottom:1rem;}p{color:#666;}</style></head>
 app.get('/api/admin/deadline-status', requireAdmin, async (req, res) => {
   const data = await getData();
   const currentWeek = getCurrentWeek();
-  const deadline = getDeadline();
-  const now = new Date();
+  const previousWeek = getPreviousWeek();
 
-  const hasApproved = await hasApprovedSubmissionThisWeek();
-  const hasPending = await hasPendingSubmissionThisWeek();
-  const deadlinePassed = now > deadline;
+  const hasApprovedThisWeek = await hasApprovedSubmissionThisWeek();
+  const previousWeekApproved = !!(await db.collection('submissions').findOne({ week: previousWeek, status: 'approved' }));
+  const previousWeekAlreadyTriggered = (data.consequencesTriggered || []).includes(previousWeek);
 
-  const canTriggerConsequence = deadlinePassed && !hasApproved;
-  const alreadyTriggered = (data.consequencesTriggered || []).includes(currentWeek);
+  // Consequences are for the previous week (whose deadline already passed)
+  const canTriggerConsequence = !previousWeekApproved && !previousWeekAlreadyTriggered;
 
   res.json({
     currentWeek,
-    deadline: deadline.toISOString(),
-    deadlinePassed,
-    hasApproved,
-    hasPending,
-    canTriggerConsequence: canTriggerConsequence && !alreadyTriggered,
-    alreadyTriggered,
+    previousWeek,
+    deadline: getDeadline().toISOString(),
+    hasApprovedThisWeek,
+    hasApprovedPreviousWeek: previousWeekApproved,
+    canTriggerConsequence,
+    alreadyTriggered: previousWeekAlreadyTriggered,
+    consequencesCount: (data.consequencesTriggered || []).length,
     paypalLink: `https://paypal.me/${CONFIG.PAYPAL_ME_USERNAME}/${CONFIG.CONSEQUENCE_AMOUNT}`,
   });
 });
 
 app.post('/api/admin/trigger-consequence', requireAdmin, async (req, res) => {
   const data = await getData();
-  const currentWeek = getCurrentWeek();
+  const previousWeek = getPreviousWeek();
 
   if (!data.consequencesTriggered) data.consequencesTriggered = [];
 
-  if (data.consequencesTriggered.includes(currentWeek)) {
-    return res.status(400).json({ error: 'Already triggered for this week' });
+  if (data.consequencesTriggered.includes(previousWeek)) {
+    return res.status(400).json({ error: 'Already triggered for last week' });
+  }
+
+  // Safety check: don't trigger if there's an approved submission
+  const approved = await db.collection('submissions').findOne({ week: previousWeek, status: 'approved' });
+  if (approved) {
+    return res.status(400).json({ error: 'Previous week has an approved submission' });
   }
 
   // Reset streak
   data.streak = 0;
-  data.consequencesTriggered.push(currentWeek);
+  data.consequencesTriggered.push(previousWeek);
   await saveData(data);
 
   const paypalLink = `https://paypal.me/${CONFIG.PAYPAL_ME_USERNAME}/${CONFIG.CONSEQUENCE_AMOUNT}`;
 
   // Notify Victor about consequence
-  await sendDiscord(`🚨 **DEADLINE MISSED** - ${currentWeek}\n\nYou missed the practice deadline. You owe $${CONFIG.CONSEQUENCE_AMOUNT}.\n\n💰 Pay here: ${paypalLink}\n\nYour streak has been reset to 0. Don't let this happen again!`, true);
+  await sendDiscord(`🚨 **DEADLINE MISSED** - ${previousWeek}\n\nYou missed the practice deadline. You owe $${CONFIG.CONSEQUENCE_AMOUNT}.\n\n💰 Pay here: ${paypalLink}\n\nYour streak has been reset to 0. Don't let this happen again!`, true);
 
   res.json({
     success: true,
@@ -856,6 +894,53 @@ app.delete('/api/admin/submissions', requireAdmin, async (req, res) => {
   res.json({ success: true, message: 'All submissions cleared' });
 });
 
+// Startup catch-up: check if we missed any cron jobs while the server was down
+async function startupDeadlineCheck() {
+  console.log('[STARTUP] Running catch-up deadline check...');
+
+  const now = getEasternNow();
+  const day = now.getDay(); // 0=Sun, 1=Mon
+
+  // Only check on Monday+ (after the deadline has passed for the previous week)
+  // Sunday is still within the deadline window, so skip
+  if (day === 0) {
+    console.log('[STARTUP] Sunday - deadline not yet passed, skipping');
+    return;
+  }
+
+  const previousWeek = getPreviousWeek();
+  const data = await getData();
+
+  if (!data.consequencesTriggered) data.consequencesTriggered = [];
+  if (data.consequencesTriggered.includes(previousWeek)) {
+    console.log(`[STARTUP] Previous week ${previousWeek} already handled`);
+    return;
+  }
+
+  const approvedSubmission = await db.collection('submissions').findOne({
+    week: previousWeek,
+    status: 'approved'
+  });
+
+  if (approvedSubmission) {
+    console.log(`[STARTUP] ${previousWeek} has approved submission, no action needed`);
+    return;
+  }
+
+  // Previous week had no approved submission and consequence wasn't triggered
+  console.log(`[STARTUP] Missed consequence for ${previousWeek}, triggering now`);
+
+  data.streak = 0;
+  data.consequencesTriggered.push(previousWeek);
+  await saveData(data);
+
+  const paypalLink = `https://paypal.me/${CONFIG.PAYPAL_ME_USERNAME}/${CONFIG.CONSEQUENCE_AMOUNT}`;
+
+  await sendDiscord(`🚨 **DEADLINE MISSED** - ${previousWeek}\n\nYou missed the practice deadline. You owe $${CONFIG.CONSEQUENCE_AMOUNT}.\n\n💰 Pay here: ${paypalLink}\n\nYour streak has been reset to 0. Don't let this happen again!`, true);
+
+  console.log('[STARTUP] Catch-up consequence triggered');
+}
+
 // Scheduled task: Saturday reminder (10 AM)
 async function saturdayReminder() {
   console.log('[CRON] Running Saturday reminder check...');
@@ -916,7 +1001,9 @@ async function mondayDeadlineCheck() {
 // Initialize and start server
 connectDB().then(async () => {
   await migrateSubmissions();
+  await fixWeekTags();
   await initializeUsers();
+  await startupDeadlineCheck();
 
   // Schedule automatic tasks
   // Saturday at 10:00 AM - reminder

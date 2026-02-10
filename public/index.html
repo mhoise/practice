@@ -163,7 +163,7 @@
 
       <div id="consequence-section" class="consequence-box hidden">
         <h3>Deadline Missed</h3>
-        <p>No approved submission this week. You can trigger the consequence.</p>
+        <p id="consequence-text">No approved submission last week. You can trigger the consequence.</p>
         <button id="trigger-consequence-btn" class="contrast">Trigger Consequence ($5)</button>
         <p id="consequence-result" style="margin-top: 1rem;"></p>
       </div>
@@ -371,7 +371,7 @@
 
         document.getElementById('admin-streak').textContent = data.streak ?? 0;
         document.getElementById('admin-days-left').textContent = data.daysUntilWedding ?? 0;
-        document.getElementById('consequences-count').textContent = deadlineData.alreadyTriggered ? '1+' : '0';
+        document.getElementById('consequences-count').textContent = deadlineData.consequencesCount ?? 0;
 
         // Storage indicator
         if (storageData) {
@@ -395,10 +395,12 @@
         }[data.thisWeekStatus] || 'No submission yet';
         statusEl.innerHTML = `<span class="${statusClass}">${statusText}</span>`;
 
-        // Consequence section
+        // Consequence section (for previous week's missed deadline)
         const consequenceSection = document.getElementById('consequence-section');
         if (deadlineData.canTriggerConsequence) {
           consequenceSection.classList.remove('hidden');
+          document.getElementById('consequence-text').textContent =
+            `No approved submission for ${deadlineData.previousWeek}. You can trigger the consequence.`;
         } else {
           consequenceSection.classList.add('hidden');
         }
