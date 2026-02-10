@@ -16,7 +16,7 @@ const PORT = process.env.PORT || 3001;
 
 // Configuration - set these in environment variables
 const CONFIG = {
-  WEDDING_DATE: new Date('2025-07-25'),
+  WEDDING_DATE: new Date('2026-07-25'),
   PAYPAL_ME_USERNAME: process.env.PAYPAL_ME_USERNAME || 'YOUR_PAYPAL_USERNAME',
   CONSEQUENCE_AMOUNT: 5,
   SESSION_SECRET: process.env.SESSION_SECRET || crypto.randomBytes(32).toString('hex'),
