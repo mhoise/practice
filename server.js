@@ -186,11 +186,15 @@ async function sendDiscord(message, mentionVictor = false) {
       ? `<@${CONFIG.VICTOR_DISCORD_ID}> ${message}`
       : message;
 
-    await fetch(CONFIG.DISCORD_WEBHOOK_URL, {
+    const response = await fetch(CONFIG.DISCORD_WEBHOOK_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ content }),
     });
+    if (!response.ok) {
+      console.error(`[DISCORD] HTTP ${response.status}: ${await response.text()}`);
+      return false;
+    }
     console.log(`[DISCORD] Sent: ${message.substring(0, 50)}...`);
     return true;
   } catch (err) {
@@ -244,6 +248,7 @@ app.use(express.json());
 
 // Health check endpoint for uptime monitoring (e.g., UptimeRobot)
 app.get('/health', (req, res) => {
+  console.log(`[HEALTH] Ping received at ${new Date().toISOString()}`);
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
