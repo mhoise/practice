@@ -26,6 +26,14 @@ const CONFIG = {
   VICTOR_DISCORD_ID: process.env.VICTOR_DISCORD_ID || '625081496541331516',
 };
 
+// Calculate consequence amount based on consecutive misses
+// $5 base, doubles every 3 misses: $5 -> $10 -> $20 -> $40 (max)
+function getConsequenceAmount(consequenceStreak) {
+  const base = CONFIG.CONSEQUENCE_AMOUNT;
+  const doublings = Math.floor(consequenceStreak / 3);
+  return Math.min(40, base * Math.pow(2, doublings));
+}
+
 // MongoDB connection
 let db;
 let bucket;
@@ -51,6 +59,7 @@ async function getData() {
       users: {},
       submissions: [],
       streak: 0,
+      consequenceStreak: 0,
       consequencesTriggered: [],
     };
     await db.collection('appData').insertOne(initial);
@@ -428,13 +437,23 @@ app.get('/api/dashboard', requireAuth, async (req, res) => {
     ? allSubmissions.slice(0, 10)
     : allSubmissions.filter(s => s.week === currentWeek);
 
+  // Calculate projected total if all remaining deadlines are missed
+  const remainingWeeks = Math.max(0, weeksUntilWedding);
+  const consequenceStreak = data.consequenceStreak || 0;
+  let projectedTotal = 0;
+  for (let i = 0; i < remainingWeeks; i++) {
+    projectedTotal += getConsequenceAmount(consequenceStreak + i);
+  }
+
   res.json({
     weeklyCode: getWeeklyCode(),
     currentWeek,
     deadline: deadline.toISOString(),
     daysUntilWedding: Math.max(0, daysUntilWedding),
-    weeksUntilWedding: Math.max(0, weeksUntilWedding),
+    weeksUntilWedding: remainingWeeks,
     streak: data.streak || 0,
+    consequenceStreak,
+    projectedTotal,
     thisWeekStatus: thisWeekSubmission ? thisWeekSubmission.status : 'not_submitted',
     submissions: visibleSubmissions,
     weddingDate: CONFIG.WEDDING_DATE.toISOString(),
@@ -649,6 +668,7 @@ app.get('/api/review', async (req, res) => {
   const data = await getData();
   if (action === 'approve') {
     data.streak = (data.streak || 0) + 1;
+    data.consequenceStreak = 0;
   }
   await saveData(data);
 
@@ -696,6 +716,8 @@ app.get('/api/admin/deadline-status', requireAdmin, async (req, res) => {
 
   // Consequences are for the previous week (whose deadline already passed)
   const canTriggerConsequence = !previousWeekApproved && !previousWeekAlreadyTriggered;
+  const consequenceStreak = data.consequenceStreak || 0;
+  const nextAmount = getConsequenceAmount(consequenceStreak);
 
   res.json({
     currentWeek,
@@ -706,7 +728,9 @@ app.get('/api/admin/deadline-status', requireAdmin, async (req, res) => {
     canTriggerConsequence,
     alreadyTriggered: previousWeekAlreadyTriggered,
     consequencesCount: (data.consequencesTriggered || []).length,
-    paypalLink: `https://paypal.me/${CONFIG.PAYPAL_ME_USERNAME}/${CONFIG.CONSEQUENCE_AMOUNT}`,
+    consequenceStreak,
+    nextAmount,
+    paypalLink: `https://paypal.me/${CONFIG.PAYPAL_ME_USERNAME}/${nextAmount}`,
   });
 });
 
@@ -726,19 +750,23 @@ app.post('/api/admin/trigger-consequence', requireAdmin, async (req, res) => {
     return res.status(400).json({ error: 'Previous week has an approved submission' });
   }
 
-  // Reset streak
+  // Update streaks
   data.streak = 0;
+  data.consequenceStreak = (data.consequenceStreak || 0) + 1;
   data.consequencesTriggered.push(previousWeek);
   await saveData(data);
 
-  const paypalLink = `https://paypal.me/${CONFIG.PAYPAL_ME_USERNAME}/${CONFIG.CONSEQUENCE_AMOUNT}`;
+  const amount = getConsequenceAmount(data.consequenceStreak - 1);
+  const paypalLink = `https://paypal.me/${CONFIG.PAYPAL_ME_USERNAME}/${amount}`;
 
   // Notify Victor about consequence
-  await sendDiscord(`🚨 **DEADLINE MISSED** - ${previousWeek}\n\nYou missed the practice deadline. You owe $${CONFIG.CONSEQUENCE_AMOUNT}.\n\n💰 Pay here: ${paypalLink}\n\nYour streak has been reset to 0. Don't let this happen again!`, true);
+  await sendDiscord(`🚨 **DEADLINE MISSED** - ${previousWeek}\n\nYou missed the practice deadline. You owe $${amount}.${data.consequenceStreak >= 3 ? ` (${data.consequenceStreak} misses in a row!)` : ''}\n\n💰 Pay here: ${paypalLink}\n\nYour streak has been reset to 0. Don't let this happen again!`, true);
 
   res.json({
     success: true,
     paypalLink,
+    amount,
+    consequenceStreak: data.consequenceStreak,
     message: 'Consequence triggered. Friend has been notified.',
   });
 });
@@ -838,6 +866,7 @@ app.post('/api/admin/submissions/:id/approve', requireAdmin, async (req, res) =>
   // Update streak
   const data = await getData();
   data.streak = (data.streak || 0) + 1;
+  data.consequenceStreak = 0;
   await saveData(data);
 
   // Notify Victor
@@ -936,12 +965,14 @@ async function startupDeadlineCheck() {
   console.log(`[STARTUP] Missed consequence for ${previousWeek}, triggering now`);
 
   data.streak = 0;
+  data.consequenceStreak = (data.consequenceStreak || 0) + 1;
   data.consequencesTriggered.push(previousWeek);
   await saveData(data);
 
-  const paypalLink = `https://paypal.me/${CONFIG.PAYPAL_ME_USERNAME}/${CONFIG.CONSEQUENCE_AMOUNT}`;
+  const amount = getConsequenceAmount(data.consequenceStreak - 1);
+  const paypalLink = `https://paypal.me/${CONFIG.PAYPAL_ME_USERNAME}/${amount}`;
 
-  await sendDiscord(`🚨 **DEADLINE MISSED** - ${previousWeek}\n\nYou missed the practice deadline. You owe $${CONFIG.CONSEQUENCE_AMOUNT}.\n\n💰 Pay here: ${paypalLink}\n\nYour streak has been reset to 0. Don't let this happen again!`, true);
+  await sendDiscord(`🚨 **DEADLINE MISSED** - ${previousWeek}\n\nYou missed the practice deadline. You owe $${amount}.${data.consequenceStreak >= 3 ? ` (${data.consequenceStreak} misses in a row!)` : ''}\n\n💰 Pay here: ${paypalLink}\n\nYour streak has been reset to 0. Don't let this happen again!`, true);
 
   console.log('[STARTUP] Catch-up consequence triggered');
 }
@@ -993,12 +1024,14 @@ async function mondayDeadlineCheck() {
   console.log(`[CRON] Triggering consequence for ${previousWeek}`);
 
   data.streak = 0;
+  data.consequenceStreak = (data.consequenceStreak || 0) + 1;
   data.consequencesTriggered.push(previousWeek);
   await saveData(data);
 
-  const paypalLink = `https://paypal.me/${CONFIG.PAYPAL_ME_USERNAME}/${CONFIG.CONSEQUENCE_AMOUNT}`;
+  const amount = getConsequenceAmount(data.consequenceStreak - 1);
+  const paypalLink = `https://paypal.me/${CONFIG.PAYPAL_ME_USERNAME}/${amount}`;
 
-  await sendDiscord(`🚨 **DEADLINE MISSED** - ${previousWeek}\n\nYou missed the practice deadline. You owe $${CONFIG.CONSEQUENCE_AMOUNT}.\n\n💰 Pay here: ${paypalLink}\n\nYour streak has been reset to 0. Don't let this happen again!`, true);
+  await sendDiscord(`🚨 **DEADLINE MISSED** - ${previousWeek}\n\nYou missed the practice deadline. You owe $${amount}.${data.consequenceStreak >= 3 ? ` (${data.consequenceStreak} misses in a row!)` : ''}\n\n💰 Pay here: ${paypalLink}\n\nYour streak has been reset to 0. Don't let this happen again!`, true);
 
   console.log('[CRON] Consequence triggered and Victor notified');
 }
